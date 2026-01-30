@@ -1,349 +1,361 @@
 """
 cron: 0 */6 * * *
-new Env("Linux.Do 签到")
+new Env("Linux.Do 签到（纯HTTP拟人浏览）")
 """
 
 import os
 import random
 import time
 import functools
-import sys
 import re
+from urllib.parse import urljoin, urlencode
+
 from loguru import logger
-from DrissionPage import ChromiumOptions, Chromium
-from tabulate import tabulate
 from curl_cffi import requests
-from bs4 import BeautifulSoup
 
+# ---------------- Config ----------------
+HOME_URL = "https://linux.do/"
+LOGIN_URL = urljoin(HOME_URL, "login")
+SESSION_URL = urljoin(HOME_URL, "session")
+CSRF_URL = urljoin(HOME_URL, "session/csrf")
 
-def retry_decorator(retries=3):
-    def decorator(func):
+USERNAME = os.environ.get("LINUXDO_USERNAME") or os.environ.get("USERNAME")
+PASSWORD = os.environ.get("LINUXDO_PASSWORD") or os.environ.get("PASSWORD")
+
+BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
+    "false", "0", "off",
+]
+
+# 拟人浏览参数（可用环境变量覆盖）
+VISIT_LOOPS = int(os.environ.get("VISIT_LOOPS", "8"))              # 列表->帖子 循环次数
+MAX_TOPIC_VISITS = int(os.environ.get("MAX_TOPIC_VISITS", "12"))   # 最多访问多少个不同 topic
+CATEGORY_ROAM_PROB = float(os.environ.get("CATEGORY_ROAM_PROB", "0.25"))  # 逛分类页概率
+PAGINATION_PROB = float(os.environ.get("PAGINATION_PROB", "0.35"))        # 列表翻页概率
+OPEN_HTML_PROB = float(os.environ.get("OPEN_HTML_PROB", "0.55"))          # topic 再开 HTML 概率
+READ_REPLIES_PROB = float(os.environ.get("READ_REPLIES_PROB", "0.35"))    # 抽取部分回复概率
+
+GOTIFY_URL = os.environ.get("GOTIFY_URL")
+GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
+SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")
+
+# ---------------- Utils ----------------
+def retry(retries=3, sleep=1.2):
+    def deco(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            for attempt in range(retries):
+            last = None
+            for i in range(retries):
                 try:
                     return func(*args, **kwargs)
                 except Exception as e:
-                    if attempt == retries - 1:  # 最后一次尝试
-                        logger.error(f"函数 {func.__name__} 最终执行失败: {str(e)}")
-                    logger.warning(
-                        f"函数 {func.__name__} 第 {attempt + 1}/{retries} 次尝试失败: {str(e)}"
-                    )
-                    time.sleep(1)
-            return None
-
+                    last = e
+                    logger.warning(f"{func.__name__} 第 {i+1}/{retries} 次失败: {e}")
+                    time.sleep(sleep)
+            raise last
         return wrapper
+    return deco
 
-    return decorator
+def human_wait():
+    """多数短停留，少数长停留（长尾分布）。"""
+    r = random.random()
+    if r < 0.6:
+        time.sleep(random.uniform(2, 8))
+    elif r < 0.9:
+        time.sleep(random.uniform(10, 25))
+    else:
+        time.sleep(random.uniform(30, 90))
 
+def jitter(min_s=0.2, max_s=1.2):
+    time.sleep(random.uniform(min_s, max_s))
 
-os.environ.pop("DISPLAY", None)
-os.environ.pop("DYLD_LIBRARY_PATH", None)
+def pick_user_agent():
+    # 不要每次都变UA；但可在启动时随机一次
+    uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    ]
+    return random.choice(uas)
 
-USERNAME = os.environ.get("LINUXDO_USERNAME")
-PASSWORD = os.environ.get("LINUXDO_PASSWORD")
-BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
-    "false",
-    "0",
-    "off",
-]
-if not USERNAME:
-    USERNAME = os.environ.get("USERNAME")
-if not PASSWORD:
-    PASSWORD = os.environ.get("PASSWORD")
-GOTIFY_URL = os.environ.get("GOTIFY_URL")  # Gotify 服务器地址
-GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")  # Gotify 应用的 API Token
-SC3_PUSH_KEY = os.environ.get("SC3_PUSH_KEY")  # Server酱³ SendKey
-
-HOME_URL = "https://linux.do/"
-LOGIN_URL = "https://linux.do/login"
-SESSION_URL = "https://linux.do/session"
-CSRF_URL = "https://linux.do/session/csrf"
-
-
-class LinuxDoBrowser:
-    def __init__(self) -> None:
-        from sys import platform
-
-        if platform == "linux" or platform == "linux2":
-            platformIdentifier = "X11; Linux x86_64"
-        elif platform == "darwin":
-            platformIdentifier = "Macintosh; Intel Mac OS X 10_15_7"
-        elif platform == "win32":
-            platformIdentifier = "Windows NT 10.0; Win64; x64"
-
-        co = (
-            ChromiumOptions()
-            .headless(True)
-            .incognito(True)
-            .set_argument("--no-sandbox")
-        )
-        co.set_user_agent(
-            f"Mozilla/5.0 ({platformIdentifier}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-        )
-        self.browser = Chromium(co)
-        self.page = self.browser.new_tab()
+# ---------------- Core ----------------
+class LinuxDoHumanBrowser:
+    def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "Accept-Language": "zh-CN,zh;q=0.9",
-            }
-        )
+        self.ua = pick_user_agent()
+        self.session.headers.update({
+            "User-Agent": self.ua,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+        self.visited_topic_ids = set()
 
-    def login(self):
-        logger.info("开始登录")
-        # Step 1: Get CSRF Token
-        logger.info("获取 CSRF token...")
+    @retry(retries=3)
+    def get_csrf(self):
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+            "User-Agent": self.ua,
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "X-Requested-With": "XMLHttpRequest",
             "Referer": LOGIN_URL,
         }
-        resp_csrf = self.session.get(CSRF_URL, headers=headers, impersonate="chrome136")
-        csrf_data = resp_csrf.json()
-        csrf_token = csrf_data.get("csrf")
-        logger.info(f"CSRF Token obtained: {csrf_token[:10]}...")
+        r = self.session.get(CSRF_URL, headers=headers, impersonate="chrome110")
+        r.raise_for_status()
+        token = r.json().get("csrf")
+        if not token:
+            raise RuntimeError("CSRF token missing")
+        return token
 
-        # Step 2: Login
-        logger.info("正在登录...")
-        headers.update(
-            {
-                "X-CSRF-Token": csrf_token,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                "Origin": "https://linux.do",
-            }
-        )
+    @retry(retries=3)
+    def login(self) -> bool:
+        logger.info("开始登录")
+        csrf = self.get_csrf()
 
+        headers = {
+            "User-Agent": self.ua,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": LOGIN_URL,
+            "X-CSRF-Token": csrf,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://linux.do",
+        }
         data = {
             "login": USERNAME,
             "password": PASSWORD,
             "second_factor_method": "1",
             "timezone": "Asia/Shanghai",
         }
-
-        try:
-            resp_login = self.session.post(
-                SESSION_URL, data=data, impersonate="chrome136", headers=headers
-            )
-
-            if resp_login.status_code == 200:
-                response_json = resp_login.json()
-                if response_json.get("error"):
-                    logger.error(f"登录失败: {response_json.get('error')}")
-                    return False
-                logger.info("登录成功!")
-            else:
-                logger.error(f"登录失败，状态码: {resp_login.status_code}")
-                logger.error(resp_login.text)
-                return False
-        except Exception as e:
-            logger.error(f"登录请求异常: {e}")
+        r = self.session.post(SESSION_URL, data=data, headers=headers, impersonate="chrome110")
+        r.raise_for_status()
+        j = r.json()
+        if j.get("error"):
+            logger.error(f"登录失败: {j.get('error')}")
             return False
 
-        self.print_connect_info()  # 打印连接信息
-
-        # Step 3: Pass cookies to DrissionPage
-        logger.info("同步 Cookie 到 DrissionPage...")
-
-        # Convert requests cookies to DrissionPage format
-        # Using standard requests.utils to parse cookiejar if possible, or manual extraction
-        # requests.Session().cookies is a specialized object, but might support standard iteration
-
-        # We can iterate over the cookies manually if dict_from_cookiejar doesn't work perfectly
-        # or convert to dict first.
-        # Assuming requests behaves like requests:
-
-        cookies_dict = self.session.cookies.get_dict()
-
-        dp_cookies = []
-        for name, value in cookies_dict.items():
-            dp_cookies.append(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": ".linux.do",
-                    "path": "/",
-                }
-            )
-
-        self.page.set.cookies(dp_cookies)
-
-        logger.info("Cookie 设置完成，导航至 linux.do...")
-        self.page.get(HOME_URL)
-
-        time.sleep(5)
-        try:
-            user_ele = self.page.ele("@id=current-user")
-        except Exception as e:
-            logger.warning(f"登录验证失败: {str(e)}")
-            return True
-        if not user_ele:
-            # Fallback check for avatar
-            if "avatar" in self.page.html:
-                logger.info("登录验证成功 (通过 avatar)")
-                return True
-            logger.error("登录验证失败 (未找到 current-user)")
-            return False
-        else:
-            logger.info("登录验证成功")
-            return True
-
-    def click_topic(self):
-        topic_list = self.page.ele("@id=list-area").eles(".:title")
-        if not topic_list:
-            logger.error("未找到主题帖")
-            return False
-        logger.info(f"发现 {len(topic_list)} 个主题帖，随机选择10个")
-        for topic in random.sample(topic_list, 10):
-            self.click_one_topic(topic.attr("href"))
+        # 访问首页/最新页“热身”一下
+        self.session.get(HOME_URL, impersonate="chrome110")
+        jitter()
+        self.session.get(urljoin(HOME_URL, "latest"), impersonate="chrome110")
+        logger.info("登录成功")
         return True
 
-    @retry_decorator()
-    def click_one_topic(self, topic_url):
-        new_page = self.browser.new_tab()
-        new_page.get(topic_url)
-        if random.random() < 0.3:  # 0.3 * 30 = 9
-            self.click_like(new_page)
-        self.browse_post(new_page)
-        new_page.close()
+    @retry(retries=3)
+    def get_latest_json(self, url: str):
+        r = self.session.get(url, impersonate="chrome110")
+        r.raise_for_status()
+        return r.json()
 
-    def browse_post(self, page):
-        prev_url = None
-        # 开始自动滚动，最多滚动10次
-        for _ in range(10):
-            # 随机滚动一段距离
-            scroll_distance = random.randint(550, 650)  # 随机滚动 550-650 像素
-            logger.info(f"向下滚动 {scroll_distance} 像素...")
-            page.run_js(f"window.scrollBy(0, {scroll_distance})")
-            logger.info(f"已加载页面: {page.url}")
+    def get_latest_first_page(self):
+        return self.get_latest_json(urljoin(HOME_URL, "latest.json"))
 
-            if random.random() < 0.03:  # 33 * 4 = 132
-                logger.success("随机退出浏览")
-                break
+    def follow_more_topics(self, latest_json):
+        # Discourse 的分页线索在 topic_list.more_topics_url [web:16]
+        tl = latest_json.get("topic_list") or {}
+        more = tl.get("more_topics_url")
+        if not more:
+            return None
+        return urljoin(HOME_URL, more.lstrip("/"))
 
-            # 检查是否到达页面底部
-            at_bottom = page.run_js(
-                "window.scrollY + window.innerHeight >= document.body.scrollHeight"
-            )
-            current_url = page.url
-            if current_url != prev_url:
-                prev_url = current_url
-            elif at_bottom and prev_url == current_url:
-                logger.success("已到达页面底部，退出浏览")
-                break
+    def extract_topics(self, latest_json):
+        tl = latest_json.get("topic_list") or {}
+        topics = tl.get("topics") or []
+        out = []
+        for t in topics:
+            tid = t.get("id")
+            slug = t.get("slug")
+            title = t.get("title") or ""
+            if tid and slug:
+                out.append((tid, slug, title))
+        return out
 
-            # 动态随机等待
-            wait_time = random.uniform(2, 4)  # 随机等待 2-4 秒
-            logger.info(f"等待 {wait_time:.2f} 秒...")
-            time.sleep(wait_time)
+    @retry(retries=3)
+    def get_categories_json(self):
+        # categories.json 常见于 Discourse；如果站点关闭也不会影响（失败则回退 latest）[web:6]
+        r = self.session.get(urljoin(HOME_URL, "categories.json"), impersonate="chrome110")
+        r.raise_for_status()
+        return r.json()
 
-    def run(self):
-        login_res = self.login()
-        if not login_res:  # 登录
-            logger.warning("登录验证失败")
-
-        if BROWSE_ENABLED:
-            click_topic_res = self.click_topic()  # 点击主题
-            if not click_topic_res:
-                logger.error("点击主题失败，程序终止")
-                return
-            logger.info("完成浏览任务")
-
-        self.send_notifications(BROWSE_ENABLED)  # 发送通知
-        self.page.close()
-        self.browser.quit()
-
-    def click_like(self, page):
+    def pick_category_latest_url(self):
         try:
-            # 专门查找未点赞的按钮
-            like_button = page.ele(".discourse-reactions-reaction-button")
-            if like_button:
-                logger.info("找到未点赞的帖子，准备点赞")
-                like_button.click()
-                logger.info("点赞成功")
-                time.sleep(random.uniform(1, 2))
-            else:
-                logger.info("帖子可能已经点过赞了")
-        except Exception as e:
-            logger.error(f"点赞失败: {str(e)}")
+            j = self.get_categories_json()
+            cats = (j.get("category_list") or {}).get("categories") or []
+            if not cats:
+                return None
+            c = random.choice(cats)
+            slug = c.get("slug")
+            cid = c.get("id")
+            if not slug or not cid:
+                return None
+            # 分类 latest JSON：/c/{slug}/{id}/l/latest.json [web:6]
+            return urljoin(HOME_URL, f"c/{slug}/{cid}/l/latest.json")
+        except Exception:
+            return None
 
-    def print_connect_info(self):
-        logger.info("获取连接信息")
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        }
-        resp = self.session.get(
-            "https://connect.linux.do/", headers=headers, impersonate="chrome136"
-        )
-        soup = BeautifulSoup(resp.text, "html.parser")
-        rows = soup.select("table tr")
-        info = []
+    @retry(retries=3)
+    def get_topic_json(self, topic_id: int, slug: str, print_mode=False):
+        # /t/{id}.json 是单 topic；print=true 可把返回 chunk_size 提到 1000（不要常用，太“机器人”）[web:24]
+        qs = "?print=true" if print_mode else ""
+        url = urljoin(HOME_URL, f"t/{topic_id}.json{qs}")
+        r = self.session.get(url, impersonate="chrome110")
+        r.raise_for_status()
+        return r.json()
 
-        for row in rows:
-            cells = row.select("td")
-            if len(cells) >= 3:
-                project = cells[0].text.strip()
-                current = cells[1].text.strip() if cells[1].text.strip() else "0"
-                requirement = cells[2].text.strip() if cells[2].text.strip() else "0"
-                info.append([project, current, requirement])
+    @retry(retries=3)
+    def get_specific_posts(self, topic_id: int, post_ids):
+        # 通过 /t/{id}/posts.json + post_ids[] 抽取部分回复 [web:24]
+        base = urljoin(HOME_URL, f"t/{topic_id}/posts.json")
+        qs = urlencode([("post_ids[]", str(pid)) for pid in post_ids])
+        r = self.session.get(f"{base}?{qs}", impersonate="chrome110")
+        r.raise_for_status()
+        return r.json()
 
-        print("--------------Connect Info-----------------")
-        print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
+    def maybe_open_topic_html(self, topic_id: int, slug: str):
+        if random.random() > OPEN_HTML_PROB:
+            return
+        # HTML 打开更像真人（但仍是 GET）
+        url = urljoin(HOME_URL, f"t/{slug}/{topic_id}")
+        self.session.get(url, impersonate="chrome110")
+        time.sleep(random.uniform(1, 4))
 
-    def send_notifications(self, browse_enabled):
-        status_msg = "✅每日登录成功: {USERNAME}"
-        if browse_enabled:
-            status_msg += " + 浏览任务完成"
+    def maybe_read_some_replies(self, topic_json: dict):
+        if random.random() > READ_REPLIES_PROB:
+            return
+        topic_id = topic_json.get("id")
+        ps = topic_json.get("post_stream") or topic_json.get("posts_stream") or {}
+        stream = ps.get("stream") or []
+        if not topic_id or not stream:
+            return
+
+        # topic.json 默认只含前 20 条左右；stream 是全部 post id 列表 [web:24]
+        # 为了“像人”，随机挑 3~12 个 post id（避开前 1-2 个）
+        tail = stream[2:] if len(stream) > 2 else stream
+        if not tail:
+            return
+        k = min(len(tail), random.randint(3, 12))
+        pick = random.sample(tail, k=k)
+        self.get_specific_posts(topic_id, pick)
+        time.sleep(random.uniform(1, 4))
+
+    def choose_latest_source(self):
+        # 有一定概率逛分类，否则逛全站 latest
+        if random.random() < CATEGORY_ROAM_PROB:
+            cat_url = self.pick_category_latest_url()
+            if cat_url:
+                return cat_url
+        return urljoin(HOME_URL, "latest.json")
+
+    def browse_like_human(self, loops=VISIT_LOOPS, max_topic_visits=MAX_TOPIC_VISITS):
+        topic_visits = 0
+        latest_url = self.choose_latest_source()
+        latest_json = self.get_latest_json(latest_url)
+
+        for _ in range(loops):
+            # 1) 列表页停留
+            human_wait()
+
+            # 2) 有概率翻页（跟随 more_topics_url 更自然）[web:16]
+            if random.random() < PAGINATION_PROB:
+                more_url = self.follow_more_topics(latest_json)
+                if more_url:
+                    latest_json = self.get_latest_json(more_url)
+                    time.sleep(random.uniform(1, 3))
+
+            topics = self.extract_topics(latest_json)
+            if not topics:
+                # 回退到首页 latest
+                latest_json = self.get_latest_first_page()
+                topics = self.extract_topics(latest_json)
+                if not topics:
+                    logger.error("无法从 latest.json 获取 topics")
+                    return False
+
+            # 3) 选 topic：偏向未访问过的
+            random.shuffle(topics)
+            chosen = None
+            for tid, slug, title in topics[:30]:
+                if tid not in self.visited_topic_ids:
+                    chosen = (tid, slug, title)
+                    break
+            if not chosen:
+                chosen = random.choice(topics)
+            tid, slug, title = chosen
+
+            logger.info(f"打开主题: {title} ({tid})")
+            self.visited_topic_ids.add(tid)
+
+            # 4) 请求 topic JSON
+            tj = self.get_topic_json(tid, slug, print_mode=False)
+            human_wait()
+
+            # 5) 可选：再开 HTML、更像“真的点开”
+            self.maybe_open_topic_html(tid, slug)
+
+            # 6) 可选：抽取一些回复 id 请求 posts.json（像在翻评论）[web:24]
+            self.maybe_read_some_replies(tj)
+
+            topic_visits += 1
+            if topic_visits >= max_topic_visits:
+                break
+
+            # 7) 偶尔“换地方逛”（换分类/回 latest）
+            if random.random() < 0.25:
+                latest_url = self.choose_latest_source()
+                latest_json = self.get_latest_json(latest_url)
+                jitter()
+
+        return True
+
+    def send_notifications(self, browse_ok: bool):
+        status_msg = f"每日登录成功: {USERNAME}"
+        if BROWSE_ENABLED:
+            status_msg += " + 拟人浏览完成" if browse_ok else " + 拟人浏览失败"
 
         if GOTIFY_URL and GOTIFY_TOKEN:
             try:
-                response = requests.post(
+                r = requests.post(
                     f"{GOTIFY_URL}/message",
                     params={"token": GOTIFY_TOKEN},
                     json={"title": "LINUX DO", "message": status_msg, "priority": 1},
                     timeout=10,
                 )
-                response.raise_for_status()
-                logger.success("消息已推送至Gotify")
+                r.raise_for_status()
+                logger.success("Gotify 推送成功")
             except Exception as e:
-                logger.error(f"Gotify推送失败: {str(e)}")
-        else:
-            logger.info("未配置Gotify环境变量，跳过通知发送")
+                logger.error(f"Gotify 推送失败: {e}")
 
         if SC3_PUSH_KEY:
-            match = re.match(r"sct(\d+)t", SC3_PUSH_KEY, re.I)
-            if not match:
-                logger.error(
-                    "❌ SC3_PUSH_KEY格式错误，未获取到UID，无法使用Server酱³推送"
-                )
+            m = re.match(r"sct(\d+)t", SC3_PUSH_KEY, re.I)
+            if not m:
+                logger.error("SC3_PUSH_KEY 格式错误，未获取到UID")
                 return
-
-            uid = match.group(1)
+            uid = m.group(1)
             url = f"https://{uid}.push.ft07.com/send/{SC3_PUSH_KEY}"
-            params = {"title": "LINUX DO", "desp": status_msg}
+            try:
+                r = requests.get(url, params={"title": "LINUX DO", "desp": status_msg}, timeout=10)
+                r.raise_for_status()
+                logger.success(f"Server酱³ 推送成功: {r.text}")
+            except Exception as e:
+                logger.error(f"Server酱³ 推送失败: {e}")
 
-            attempts = 5
-            for attempt in range(attempts):
-                try:
-                    response = requests.get(url, params=params, timeout=10)
-                    response.raise_for_status()
-                    logger.success(f"Server酱³推送成功: {response.text}")
-                    break
-                except Exception as e:
-                    logger.error(f"Server酱³推送失败: {str(e)}")
-                    if attempt < attempts - 1:
-                        sleep_time = random.randint(180, 360)
-                        logger.info(f"将在 {sleep_time} 秒后重试...")
-                        time.sleep(sleep_time)
+    def run(self):
+        if not self.login():
+            self.send_notifications(False)
+            return
 
+        browse_ok = True
+        if BROWSE_ENABLED:
+            try:
+                browse_ok = self.browse_like_human()
+                if browse_ok:
+                    logger.info("拟人浏览任务完成")
+            except Exception as e:
+                browse_ok = False
+                logger.error(f"拟人浏览异常: {e}")
+
+        self.send_notifications(browse_ok)
 
 if __name__ == "__main__":
     if not USERNAME or not PASSWORD:
-        print("Please set USERNAME and PASSWORD")
-        exit(1)
-    l = LinuxDoBrowser()
-    l.run()
+        raise SystemExit("Please set USERNAME/PASSWORD or LINUXDO_USERNAME/LINUXDO_PASSWORD")
+    LinuxDoHumanBrowser().run()
