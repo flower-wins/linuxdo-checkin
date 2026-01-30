@@ -1,6 +1,6 @@
 """
 cron: 0 */6 * * *
-new Env("Linux.Do 签到（纯HTTP拟人浏览-增强稳定版）")
+new Env("Linux.Do 签到（纯HTTP拟人浏览-更多读帖版）")
 """
 
 import os
@@ -8,7 +8,6 @@ import random
 import time
 import functools
 import re
-import json
 from urllib.parse import urljoin, urlencode
 
 from loguru import logger
@@ -23,16 +22,27 @@ CURRENT_USER_URL = urljoin(HOME_URL, "session/current.json")  # 登录态探测 
 USERNAME = os.environ.get("LINUXDO_USERNAME") or os.environ.get("USERNAME")
 PASSWORD = os.environ.get("LINUXDO_PASSWORD") or os.environ.get("PASSWORD")
 
-BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in [
-    "false", "0", "off",
-]
+BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in ["false", "0", "off"]
 
-VISIT_LOOPS = int(os.environ.get("VISIT_LOOPS", "8"))
-MAX_TOPIC_VISITS = int(os.environ.get("MAX_TOPIC_VISITS", "12"))
+# ========== 读帖量参数（重点）==========
+VISIT_LOOPS = int(os.environ.get("VISIT_LOOPS", "30"))              # 列表->进帖 循环次数
+MAX_TOPIC_VISITS = int(os.environ.get("MAX_TOPIC_VISITS", "50"))    # 最多访问多少个不同 topic
+
+# 每个 topic “读回复”的强度（会额外请求 posts.json）
+READ_REPLIES_PROB = float(os.environ.get("READ_REPLIES_PROB", "0.80"))
+READ_MIN_POSTS = int(os.environ.get("READ_MIN_POSTS", "20"))        # 每个topic最少额外读多少楼（从stream里抽）
+READ_MAX_POSTS = int(os.environ.get("READ_MAX_POSTS", "80"))        # 每个topic最多额外读多少楼
+POST_IDS_BATCH = int(os.environ.get("POST_IDS_BATCH", "20"))        # 每次 posts.json 带多少 post_ids[]；Discourse 常见做法是 20 [web:24]
+
+# 分布/行为概率
 CATEGORY_ROAM_PROB = float(os.environ.get("CATEGORY_ROAM_PROB", "0.25"))
-PAGINATION_PROB = float(os.environ.get("PAGINATION_PROB", "0.35"))
+PAGINATION_PROB = float(os.environ.get("PAGINATION_PROB", "0.70"))
 OPEN_HTML_PROB = float(os.environ.get("OPEN_HTML_PROB", "0.55"))
-READ_REPLIES_PROB = float(os.environ.get("READ_REPLIES_PROB", "0.35"))
+
+# 停留时间（整体更短，保证读得多）
+SHORT_WAIT = (float(os.environ.get("SHORT_WAIT_MIN", "1.0")), float(os.environ.get("SHORT_WAIT_MAX", "4.0")))
+MID_WAIT = (float(os.environ.get("MID_WAIT_MIN", "4.0")), float(os.environ.get("MID_WAIT_MAX", "10.0")))
+LONG_WAIT = (float(os.environ.get("LONG_WAIT_MIN", "12.0")), float(os.environ.get("LONG_WAIT_MAX", "35.0")))
 
 GOTIFY_URL = os.environ.get("GOTIFY_URL")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
@@ -58,12 +68,12 @@ def retry(retries=3, base_sleep=1.2):
 
 def human_wait():
     r = random.random()
-    if r < 0.6:
-        time.sleep(random.uniform(2, 8))
-    elif r < 0.9:
-        time.sleep(random.uniform(10, 25))
+    if r < 0.65:
+        time.sleep(random.uniform(*SHORT_WAIT))
+    elif r < 0.93:
+        time.sleep(random.uniform(*MID_WAIT))
     else:
-        time.sleep(random.uniform(30, 90))
+        time.sleep(random.uniform(*LONG_WAIT))
 
 
 def jitter(min_s=0.2, max_s=1.2):
@@ -88,13 +98,17 @@ class LinuxDoHumanBrowser:
             "Accept-Language": "zh-CN,zh;q=0.9",
         })
         self.visited_topic_ids = set()
+        self.stats = {
+            "topics": 0,
+            "list_pages": 0,
+            "topic_json": 0,
+            "topic_html": 0,
+            "posts_json_calls": 0,
+            "extra_posts_read": 0,
+            "rate_limit_wait_s": 0,
+        }
 
     def _request(self, method, url, *, expect_json=False, headers=None, data=None, params=None, timeout=25, retries=3):
-        """
-        更稳健的请求：
-        - 处理 429：按 Retry-After 退避重试 [web:49]
-        - JSON：检查 Content-Type/响应体，避免直接 .json() 崩
-        """
         hdrs = {}
         if headers:
             hdrs.update(headers)
@@ -105,7 +119,7 @@ class LinuxDoHumanBrowser:
             hdrs.setdefault("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
         last_err = None
-        for attempt in range(retries):
+        for _ in range(retries):
             r = self.session.request(
                 method, url,
                 headers=hdrs,
@@ -115,32 +129,25 @@ class LinuxDoHumanBrowser:
                 impersonate="chrome110",
             )
 
-            # 429 rate limit: obey Retry-After if present [web:49]
             if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 wait_s = int(ra) if (ra and ra.isdigit()) else random.randint(10, 30)
+                self.stats["rate_limit_wait_s"] += wait_s
                 logger.warning(f"触发 429，等待 {wait_s}s 后重试")
                 time.sleep(wait_s + random.uniform(0, 2))
                 continue
 
-            # 有些防护会返回 200 但内容是 HTML challenge/login 页，导致 JSONDecodeError
             if expect_json:
                 ctype = (r.headers.get("Content-Type") or "").lower()
                 text = (r.text or "").lstrip()
                 if r.status_code >= 400:
-                    snippet = (text[:200] if text else "")
-                    raise RuntimeError(f"HTTP {r.status_code} for JSON url={url} body_snippet={snippet}")
-
-                # Content-Type 不像 JSON 且 body 以 < 开头，多半是 HTML
+                    raise RuntimeError(f"HTTP {r.status_code} for JSON url={url} body_snippet={(text[:200] if text else '')}")
                 if ("json" not in ctype) and text.startswith("<"):
-                    snippet = text[:200]
-                    raise RuntimeError(f"返回HTML而非JSON url={url} ctype={ctype} snippet={snippet}")
-
+                    raise RuntimeError(f"返回HTML而非JSON url={url} ctype={ctype} snippet={text[:200]}")
                 try:
                     return r.json()
                 except Exception as e:
-                    snippet = (r.text or "")[:200]
-                    last_err = RuntimeError(f"JSON解析失败 url={url} ctype={ctype} err={e} snippet={snippet}")
+                    last_err = RuntimeError(f"JSON解析失败 url={url} ctype={ctype} err={e} snippet={(r.text or '')[:200]}")
                     time.sleep(1.0 + random.uniform(0, 1.0))
                     continue
 
@@ -153,10 +160,7 @@ class LinuxDoHumanBrowser:
         rj = self._request(
             "GET", CSRF_URL,
             expect_json=True,
-            headers={
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": LOGIN_URL,
-            },
+            headers={"X-Requested-With": "XMLHttpRequest", "Referer": LOGIN_URL},
         )
         token = rj.get("csrf")
         if not token:
@@ -189,27 +193,27 @@ class LinuxDoHumanBrowser:
             logger.error(f"登录失败: {rj.get('error')}")
             return False
 
-        # 登录态探测：/session/current.json（已登录 200，未登录常见 404）[web:48]
         try:
             cur = self._request("GET", CURRENT_USER_URL, expect_json=True, retries=2)
             logger.info(f"登录成功: {cur.get('current_user', {}).get('username', USERNAME)}")
         except Exception:
             logger.info("登录成功（未能读取 current.json，但 cookie 已写入）")
 
-        # 热身
         self._request("GET", HOME_URL, expect_json=False, retries=2)
         jitter()
         self._request("GET", urljoin(HOME_URL, "latest"), expect_json=False, retries=2)
         return True
 
+    # -------- Discourse list/topic helpers --------
     def get_latest_json(self, url):
+        self.stats["list_pages"] += 1
         return self._request("GET", url, expect_json=True)
 
     def get_latest_first_page(self):
         return self.get_latest_json(urljoin(HOME_URL, "latest.json"))
 
     def follow_more_topics(self, latest_json):
-        # more_topics_url 用于继续加载列表（滚动加载/翻页线索）[web:16]
+        # more_topics_url 指向下一页 [web:16]
         tl = latest_json.get("topic_list") or {}
         more = tl.get("more_topics_url")
         if not more:
@@ -242,17 +246,17 @@ class LinuxDoHumanBrowser:
             cid = c.get("id")
             if not slug or not cid:
                 return None
-            # 分类 latest JSON：/c/{slug}/{id}/l/latest.json [web:16]
             return urljoin(HOME_URL, f"c/{slug}/{cid}/l/latest.json")
         except Exception:
             return None
 
     def get_topic_json(self, topic_id: int):
-        # 用 /t/{id}.json；更稳（不依赖 slug）[web:24]
+        self.stats["topic_json"] += 1
+        # /t/{id}.json 默认只返回 20 楼左右；stream 里有全部 post id [web:24]
         return self._request("GET", urljoin(HOME_URL, f"t/{topic_id}.json"), expect_json=True, retries=3)
 
     def get_specific_posts(self, topic_id: int, post_ids):
-        # 抽取部分 post（像在看评论）[web:24]
+        self.stats["posts_json_calls"] += 1
         base = urljoin(HOME_URL, f"t/{topic_id}/posts.json")
         qs = urlencode([("post_ids[]", str(pid)) for pid in post_ids])
         return self._request("GET", f"{base}?{qs}", expect_json=True, retries=3)
@@ -260,10 +264,11 @@ class LinuxDoHumanBrowser:
     def maybe_open_topic_html(self, topic_id: int, slug: str):
         if random.random() > OPEN_HTML_PROB:
             return
+        self.stats["topic_html"] += 1
         self._request("GET", urljoin(HOME_URL, f"t/{slug}/{topic_id}"), expect_json=False, retries=2)
-        time.sleep(random.uniform(1, 4))
+        time.sleep(random.uniform(0.8, 2.8))
 
-    def maybe_read_some_replies(self, topic_json: dict):
+    def read_more_replies(self, topic_json: dict):
         if random.random() > READ_REPLIES_PROB:
             return
         topic_id = topic_json.get("id")
@@ -271,13 +276,24 @@ class LinuxDoHumanBrowser:
         stream = ps.get("stream") or []
         if not topic_id or not stream:
             return
-        tail = stream[2:] if len(stream) > 2 else stream
-        if not tail:
+
+        # 前 20 个一般已经包含在 topic.json 的 posts 里 [web:24]
+        remaining = stream[20:] if len(stream) > 20 else []
+        if not remaining:
             return
-        k = min(len(tail), random.randint(3, 10))
-        pick = random.sample(tail, k=k)
-        self.get_specific_posts(topic_id, pick)
-        time.sleep(random.uniform(1, 4))
+
+        want = min(len(remaining), random.randint(READ_MIN_POSTS, READ_MAX_POSTS))
+        # 更像真人：偏向读“靠后”的（最新回复），但又夹杂一些随机
+        tail_pool = remaining[-300:] if len(remaining) > 300 else remaining
+        pick = random.sample(tail_pool, k=min(len(tail_pool), want))
+
+        # 按批次拉取；Discourse 文档示例是 20 个一批 [web:24]
+        batch = max(1, POST_IDS_BATCH)
+        for i in range(0, len(pick), batch):
+            ids = pick[i:i+batch]
+            self.get_specific_posts(topic_id, ids)
+            self.stats["extra_posts_read"] += len(ids)
+            time.sleep(random.uniform(0.8, 3.0))
 
     def choose_latest_source(self):
         if random.random() < CATEGORY_ROAM_PROB:
@@ -289,8 +305,6 @@ class LinuxDoHumanBrowser:
     def browse_like_human(self, loops=VISIT_LOOPS, max_topic_visits=MAX_TOPIC_VISITS):
         topic_visits = 0
         latest_url = self.choose_latest_source()
-
-        # 首次拉列表失败就回退 latest.json 首屏
         try:
             latest_json = self.get_latest_json(latest_url)
         except Exception as e:
@@ -300,15 +314,19 @@ class LinuxDoHumanBrowser:
         for _ in range(loops):
             human_wait()
 
+            # 翻页：连续跟 1~3 次 more_topics_url（像滚动加载）[web:16]
             if random.random() < PAGINATION_PROB:
-                more_url = self.follow_more_topics(latest_json)
-                if more_url:
+                for __ in range(random.randint(1, 3)):
+                    more_url = self.follow_more_topics(latest_json)
+                    if not more_url:
+                        break
                     try:
                         latest_json = self.get_latest_json(more_url)
-                        time.sleep(random.uniform(1, 3))
+                        time.sleep(random.uniform(0.8, 2.5))
                     except Exception as e:
                         logger.warning(f"翻页失败，回退首屏: {e}")
                         latest_json = self.get_latest_first_page()
+                        break
 
             topics = self.extract_topics(latest_json)
             if not topics:
@@ -317,10 +335,9 @@ class LinuxDoHumanBrowser:
                 if not topics:
                     raise RuntimeError("无法从 latest.json 获取 topics")
 
-            # 更像真人：优先选未访问过的
             random.shuffle(topics)
             chosen = None
-            for tid, slug, title in topics[:40]:
+            for tid, slug, title in topics[:60]:
                 if tid not in self.visited_topic_ids:
                     chosen = (tid, slug, title)
                     break
@@ -330,17 +347,19 @@ class LinuxDoHumanBrowser:
             tid, slug, title = chosen
             logger.info(f"打开主题: {title} ({tid})")
             self.visited_topic_ids.add(tid)
+            self.stats["topics"] += 1
 
             tj = self.get_topic_json(tid)
             human_wait()
 
             self.maybe_open_topic_html(tid, slug)
-            self.maybe_read_some_replies(tj)
+            self.read_more_replies(tj)
 
             topic_visits += 1
             if topic_visits >= max_topic_visits:
                 break
 
+            # 偶尔换“逛的地方”
             if random.random() < 0.25:
                 latest_url = self.choose_latest_source()
                 try:
@@ -352,16 +371,17 @@ class LinuxDoHumanBrowser:
         return True
 
     def send_notifications(self, browse_ok: bool):
-        status_msg = f"每日登录成功: {USERNAME}"
+        msg = f"每日登录成功: {USERNAME}"
         if BROWSE_ENABLED:
-            status_msg += " + 拟人浏览完成" if browse_ok else " + 拟人浏览失败"
+            msg += " + 拟人浏览完成" if browse_ok else " + 拟人浏览失败"
+        msg += f"\nTopics: {self.stats['topics']}, list_pages: {self.stats['list_pages']}, topic_json: {self.stats['topic_json']}, posts_calls: {self.stats['posts_json_calls']}, extra_posts: {self.stats['extra_posts_read']}, rl_wait_s: {self.stats['rate_limit_wait_s']}"
 
         if GOTIFY_URL and GOTIFY_TOKEN:
             try:
                 r = requests.post(
                     f"{GOTIFY_URL}/message",
                     params={"token": GOTIFY_TOKEN},
-                    json={"title": "LINUX DO", "message": status_msg, "priority": 1},
+                    json={"title": "LINUX DO", "message": msg, "priority": 1},
                     timeout=10,
                 )
                 r.raise_for_status()
@@ -377,7 +397,7 @@ class LinuxDoHumanBrowser:
             uid = m.group(1)
             url = f"https://{uid}.push.ft07.com/send/{SC3_PUSH_KEY}"
             try:
-                r = requests.get(url, params={"title": "LINUX DO", "desp": status_msg}, timeout=10)
+                r = requests.get(url, params={"title": "LINUX DO", "desp": msg}, timeout=10)
                 r.raise_for_status()
                 logger.success(f"Server酱³ 推送成功: {r.text}")
             except Exception as e:
